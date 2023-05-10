@@ -1,0 +1,358 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <queue>
+
+#include <cuda_runtime.h>
+
+#define SYMBOL_COUNT 256
+#define BLOCK_SIZE 256
+
+struct HuffmanNode {
+    char symbol;
+    int frequency;
+    int leftChildIndex;
+    int rightChildIndex;
+};
+
+__global__ void countSymbolFrequenciesKernel(char* inputData, int dataSize, int* frequencyData) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < dataSize) {
+        atomicAdd(&(frequencyData[inputData[index]]), 1);
+    }
+}
+
+__global__ void buildHuffmanTreeKernel(HuffmanNode* huffmanNodes, int* frequencyData) {
+    int nodeCount = SYMBOL_COUNT;
+    int parentIndex = nodeCount - 1;
+
+    while (nodeCount > 1) {
+        int minIndex1 = -1, minIndex2 = -1;
+        int minFrequency1 = INT_MAX, minFrequency2 = INT_MAX;
+
+        for (int i = 0; i < nodeCount; i++) {
+            if (huffmanNodes[i].frequency < minFrequency1) {
+                minFrequency2 = minFrequency1;
+                minIndex2 = minIndex1;
+                minFrequency1 = huffmanNodes[i].frequency;
+                minIndex1 = i;
+            } else if (huffmanNodes[i].frequency < minFrequency2) {
+                minFrequency2 = huffmanNodes[i].frequency;
+                minIndex2 = i;
+            }
+        }
+
+        huffmanNodes[parentIndex].frequency = minFrequency1 + minFrequency2;
+        huffmanNodes[parentIndex].leftChildIndex = minIndex1;
+        huffmanNodes[parentIndex].rightChildIndex = minIndex2;
+
+        nodeCount--;
+        parentIndex--;
+    }
+}
+
+__global__ void generateHuffmanCodesKernel(HuffmanNode* huffmanNodes, char** codeTable, char* code, int codeLength, int currentNodeIndex) {
+    HuffmanNode currentNode = huffmanNodes[currentNodeIndex];
+
+    if (currentNode.leftChildIndex == -1 && currentNode.rightChildIndex == -1) {
+        code[codeLength] = '\0';
+        codeTable[currentNode.symbol] = (char*) malloc((codeLength + 1) * sizeof(char));
+        strcpy(codeTable[currentNode.symbol], code);
+    } else {
+        code[codeLength] = '0';
+        generateHuffmanCodesKernel(huffmanNodes, codeTable, code, codeLength + 1, currentNode.leftChildIndex);
+
+        code[codeLength] = '1';
+        generateHuffmanCodesKernel(huffmanNodes, codeTable, code, codeLength + 1, currentNode.rightChildIndex);
+    }
+}
+
+__global__ void encodeDataKernel(char* inputData, int dataSize, char* outputData, char** codeTable) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < dataSize) {
+        char* code = codeTable[inputData[index]];
+        strcat(outputData, code);
+    }
+}
+
+int main() {
+    // Read in the input data
+    FILE* inputFile = fopen("input.txt", "r");
+
+    if (!inputFile) {
+        printf("Error: could not open input file\n");
+        return 1;
+    }
+
+    fseek(inputFile, 0, SEEK_END);
+    int dataSize = ftell(inputFile);
+    rewind(inputFile);
+
+    char* inputData = (char*) malloc(dataSize * sizeof(char));
+    fread(inputData, sizeof(char), dataSize, inputFile);
+
+    fclose(inputFile);
+
+    // Allocate memory on the GPU
+    char* d_inputData;
+    char* d_outputData;
+    int* d_frequency;
+
+    cudaMalloc((void**) &d_inputData, dataSize * sizeof(char));
+    cudaMalloc((void**) &d_outputData, dataSize * sizeof(char));
+    cudaMalloc((void**) &d_frequencyData, SYMBOL_COUNT * sizeof(int));
+
+    // Copy data from the CPU to the GPU
+    cudaMemcpy(d_inputData, inputData, dataSize * sizeof(char), cudaMemcpyHostToDevice);
+
+    // Initialize the frequency data to zero on the GPU
+    cudaMemset(d_frequencyData, 0, SYMBOL_COUNT * sizeof(int));
+
+    // Count the frequency of each symbol in the input data on the GPU
+    int blockSize = BLOCK_SIZE;
+    int numBlocks = (dataSize + blockSize - 1) / blockSize;
+    countSymbolFrequenciesKernel<<<numBlocks, blockSize>>>(d_inputData, dataSize, d_frequencyData);
+
+    // Allocate memory on the CPU for the frequency data
+    int* frequencyData = (int*) malloc(SYMBOL_COUNT * sizeof(int));
+
+    // Copy the frequency data from the GPU to the CPU
+    cudaMemcpy(frequencyData, d_frequencyData, SYMBOL_COUNT * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Allocate memory on the CPU for the Huffman nodes
+    HuffmanNode* huffmanNodes = (HuffmanNode*) malloc(SYMBOL_COUNT * sizeof(HuffmanNode));
+
+    // Initialize the Huffman nodes with the symbol and frequency data
+    for (int i = 0; i < SYMBOL_COUNT; i++) {
+        huffmanNodes[i].symbol = i;
+        huffmanNodes[i].frequency = frequencyData[i];
+        huffmanNodes[i].leftChildIndex = -1;
+        huffmanNodes[i].rightChildIndex = -1;
+    }
+
+    // Build the Huffman tree on the GPU
+    buildHuffmanTreeKernel<<<1, 1>>>(d_huffmanNodes, d_frequencyData);
+
+    // Allocate memory on the CPU for the Huffman nodes
+    cudaMemcpy(huffmanNodes, d_huffmanNodes, (SYMBOL_COUNT - 1) * sizeof(HuffmanNode), cudaMemcpyDeviceToHost);
+
+    // Allocate memory on the CPU for the Huffman codes
+    char** codeTable = (char**) malloc(SYMBOL_COUNT * sizeof(char*));
+
+    // Allocate memory on the GPU for the Huffman codes
+    char** d_codeTable;
+    cudaMalloc((void**) &d_codeTable, SYMBOL_COUNT * sizeof(char*));
+
+    // Allocate memory on the CPU for the current Huffman code
+    char* code = (char*) malloc(SYMBOL_COUNT * sizeof(char));
+
+    // Generate the Huffman codes on the GPU
+    generateHuffmanCodesKernel<<<1, 1>>>(d_huffmanNodes, d_codeTable, code, 0, SYMBOL_COUNT - 2);
+
+    // Copy the Huffman codes from the GPU to the CPU
+    cudaMemcpy(codeTable, d_codeTable, SYMBOL_COUNT * sizeof(char*), cudaMemcpyDeviceToHost);
+
+    // Encode the input data using the Huffman codes on the GPU
+    int outputSize = 0;
+    for (int i = 0; i < dataSize; i++) {
+        outputSize += strlen(codeTable[inputData[i]]);
+    }
+
+    char* outputData = (char*) malloc(outputSize * sizeof(char));
+    cudaMemset(d_outputData, '\0', outputSize * sizeof(char));
+
+    encodeDataKernel<<<numBlocks, blockSize>>>(d_inputData, dataSize, d_outputData, d_codeTable);
+
+    cudaMemcpy(outputData, d_outputData, outputSize * sizeof(char), cudaMemcpyDeviceToHost);
+
+    // Write the output data to a file
+ // Write the output data to a file
+FILE* outputFile = fopen("output.txt", "w");
+
+if (!outputFile) {
+    printf("Error opening output file.");
+    return 1;
+}
+
+fprintf(outputFile, "%s", outputData);
+fclose(outputFile);
+
+// Free allocated memory on the CPU and GPU
+free(inputData);
+free(frequencyData);
+free(huffmanNodes);
+free(outputData);
+free(code);
+
+cudaFree(d_inputData);
+cudaFree(d_outputData);
+cudaFree(d_frequencyData);
+cudaFree(d_huffmanNodes);
+cudaFree(d_codeTable);
+
+return 0;
+
+}
+
+
+
+///////
+
+
+Huffman
+#include <iostream>
+#include <cuda_runtime.h>
+
+__global__ void buildHuffmanTree(int* frequencies, int* tree, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        // Find the two lowest frequency nodes
+        int min1 = INT_MAX, min2 = INT_MAX;
+        int minIndex1, minIndex2;
+        for (int j = 0; j < n; j++) {
+            if (frequencies[j] != 0 && frequencies[j] < min1) {
+                min2 = min1;
+                minIndex2 = minIndex1;
+                min1 = frequencies[j];
+                minIndex1 = j;
+            } else if (frequencies[j] != 0 && frequencies[j] < min2) {
+                min2 = frequencies[j];
+                minIndex2 = j;
+            }
+        }
+        // Combine the two lowest frequency nodes into a new node
+        int newNodeIndex = n + i;
+        frequencies[newNodeIndex] = min1 + min2;
+        tree[newNodeIndex] = 0;
+        tree[newNodeIndex + n] = 0;
+        if (minIndex1 < minIndex2) {
+            tree[newNodeIndex] = minIndex1;
+            tree[newNodeIndex + n] = minIndex2;
+        } else {
+            tree[newNodeIndex] = minIndex2;
+            tree[newNodeIndex + n] = minIndex1;
+        }
+    }
+}
+
+int main() {
+    int n = 256;
+    int* frequencies;
+    int* tree;
+    cudaMalloc(&frequencies, n * sizeof(int));
+    cudaMalloc(&tree, 2 * n * sizeof(int));
+
+    // Initialize frequencies
+    for (int i = 0; i < n; i++) {
+        frequencies[i] = i + 1;
+    }
+
+    int numBlocks = (n + 255) / 256;
+    buildHuffmanTree<<<numBlocks, 256>>>(frequencies, tree, n);
+
+    // Encode the data using the Huffman tree
+    // ...
+
+    cudaFree(frequencies);
+    cudaFree(tree);
+    return 0;
+}
+
+/////////
+
+
+Mpi quicksort
+#include <iostream>
+#include <algorithm>
+#include <mpi.h>
+using namespace std;
+
+// Function to partition the array
+int partition(int arr[], int low, int high) {
+    int pivot = arr[high];
+    int i = (low - 1);
+    for (int j = low; j <= high - 1; j++) {
+        if (arr[j] <= pivot) {
+            i++;
+            swap(arr[i], arr[j]);
+        }
+    }
+    swap(arr[i + 1], arr[high]);
+    return (i + 1);
+}
+
+// Function to perform quicksort on the partition
+void quicksort(int arr[], int low, int high) {
+    if (low < high) {
+        int pivot = partition(arr, low, high);
+        quicksort(arr, low, pivot - 1);
+        quicksort(arr, pivot + 1, high);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    int rank, size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    int n = 100;
+    int* arr = new int[n];
+    int* recvbuf = new int[n];
+    int* sendbuf = new int[n];
+
+    // Fill the array with random values
+    if (rank == 0) {
+        for (int i = 0; i < n; i++) {
+            arr[i] = rand() % 100;
+        }
+    }
+
+    // Divide the array into equal-sized partitions for each process
+    int sub_arr_size = n / size;
+    int* sub_arr = new int[sub_arr_size];
+    MPI_Scatter(arr, sub_arr_size, MPI_INT, sub_arr, sub_arr_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Sort the partition using quicksort
+    quicksort(sub_arr, 0, sub_arr_size - 1);
+
+    // Gather the sorted partitions from each process
+    MPI_Gather(sub_arr, sub_arr_size, MPI_INT, recvbuf, sub_arr_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Print the sorted array
+    if (rank == 0) {
+        cout << "Sorted array: ";
+        for (int i = 0; i < n; i++) {
+            cout << recvbuf[i] << " ";
+        }
+        cout << endl;
+
+        // Measure the execution time of the parallel quicksort algorithm
+        double start_time = MPI_Wtime();
+        // Perform the above steps again
+        double end_time = MPI_Wtime();
+        double parallel_execution_time = end_time - start_time;
+
+        // Measure the execution time of the sequential quicksort algorithm
+        start_time = MPI_Wtime();
+        quicksort(arr, 0, n - 1);
+        end_time = MPI_Wtime();
+        double sequential_execution_time = end_time - start_time;
+
+        // Calculate speedup and efficiency
+        double speedup = sequential_execution_time / parallel_execution_time;
+        double efficiency = speedup / size;
+
+        cout << "Sequential execution time: " << sequential_execution_time << endl;
+        cout << "Parallel execution time: " << parallel_execution_time << endl;
+        cout << "Speedup: " << speedup << endl;
+        cout << "Efficiency: " << efficiency << endl;
+    }
+
+    MPI_Finalize();
+    return 0;
+}
+
+
